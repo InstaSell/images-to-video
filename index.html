@@ -942,10 +942,14 @@
               <label>Quality</label>
               <div class="quality-grid">
                 <div class="quality-option active" data-quality="720">
-                  HD Reel
+                  HD (720×1280)
                 </div>
-                <div class="quality-option" data-quality="1080">FHD Reel</div>
-                <div class="quality-option" data-quality="480">SD Reel</div>
+                <div class="quality-option" data-quality="1080">
+                  FHD (1080×1920)
+                </div>
+                <div class="quality-option" data-quality="480">
+                  SD (480×854)
+                </div>
               </div>
             </div>
             <div class="control-group">
@@ -959,8 +963,7 @@
             <div class="control-group">
               <label>Format</label>
               <select class="control-input" id="outputFormat">
-                <option value="webm">WebM</option>
-                <option value="mp4">MP4</option>
+                <option value="mp4" selected>MP4 (H.264)</option>
               </select>
             </div>
           </div>
@@ -1679,10 +1682,8 @@
             const elapsed = Date.now() - startTime;
             const progress = Math.min(elapsed / duration, 1);
 
-            const eased =
-              progress < 0.5
-                ? 4 * progress * progress * progress
-                : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+            // Use the same easing function as export
+            const eased = this.applyEasing(progress);
 
             this.drawImageWithEffect(imageData, eased);
 
@@ -1800,25 +1801,66 @@
           exportBtn.classList.add("processing");
 
           try {
-            this.showStatus("Preparing video export...", "info");
-
             const frameRate = parseInt(
               document.getElementById("frameRate").value
             );
             const format = document.getElementById("outputFormat").value;
-            const mimeType = format === "mp4" ? "video/mp4" : "video/webm";
+
+            // Calculate and display expected duration
+            const expectedDuration = this.images.reduce(
+              (sum, img) => sum + img.duration,
+              0
+            );
+            console.log(
+              "Images:",
+              this.images.map((img) => ({
+                name: img.name,
+                duration: img.duration,
+              }))
+            );
+            console.log(
+              "Expected total duration:",
+              expectedDuration,
+              "seconds"
+            );
+
+            this.showStatus(
+              `Preparing video export... (${expectedDuration}s expected)`,
+              "info"
+            );
+
+            // Try to use the most compatible MP4 codec
+            let mimeType = "video/mp4";
+            const supportedTypes = [
+              "video/mp4; codecs=h264",
+              "video/mp4; codecs=avc1",
+              "video/mp4",
+              "video/webm; codecs=vp9",
+              "video/webm; codecs=vp8",
+              "video/webm",
+            ];
+
+            for (const type of supportedTypes) {
+              if (MediaRecorder.isTypeSupported(type)) {
+                mimeType = type;
+                break;
+              }
+            }
+
+            console.log("Using MIME type:", mimeType);
 
             const stream = this.canvas.captureStream(frameRate);
             this.recordedChunks = [];
 
+            // Enhanced bitrate calculation based on resolution and quality
+            const bitrate = this.calculateOptimalBitrate(
+              this.selectedQuality,
+              frameRate
+            );
+
             this.mediaRecorder = new MediaRecorder(stream, {
               mimeType: mimeType,
-              videoBitsPerSecond:
-                this.selectedQuality === 1080
-                  ? 8000000 // Higher bitrate for vertical FHD
-                  : this.selectedQuality === 720
-                  ? 4000000 // Higher bitrate for vertical HD
-                  : 2000000, // Higher bitrate for vertical SD
+              videoBitsPerSecond: bitrate,
             });
 
             this.mediaRecorder.ondataavailable = (event) => {
@@ -1831,10 +1873,25 @@
               this.finalizeVideo(format);
             };
 
-            this.mediaRecorder.start();
+            // Start recording with smaller chunks for better quality
+            this.mediaRecorder.start(100); // Record in 100ms chunks
             this.showStatus("Recording video...", "info");
 
+            // Wait a bit for MediaRecorder to initialize
+            await new Promise((resolve) => setTimeout(resolve, 100));
+
+            const startTime = Date.now();
             await this.renderVideo(frameRate);
+            const renderTime = Date.now() - startTime;
+
+            console.log("Render time:", renderTime, "ms");
+            console.log("Expected render time:", expectedDuration * 1000, "ms");
+
+            // Wait proportionally to the video duration to ensure all frames are captured
+            const waitTime = Math.max(500, expectedDuration * 100); // At least 500ms, or 10% of video duration
+            console.log("Waiting", waitTime, "ms before stopping recorder");
+            await new Promise((resolve) => setTimeout(resolve, waitTime));
+
             this.mediaRecorder.stop();
           } catch (error) {
             console.error("Export error:", error);
@@ -1848,68 +1905,176 @@
         }
 
         async renderVideo(frameRate) {
-          const frameDuration = 1000 / frameRate;
-          let currentImageIndex = 0;
-          let imageStartTime = 0;
           const progressBar = document.getElementById("progressBar");
-
           progressBar.classList.add("active");
 
           return new Promise((resolve) => {
-            const renderFrame = () => {
-              const currentTime = Date.now() - imageStartTime;
-              const currentImage = this.images[currentImageIndex];
+            let frameCount = 0;
+            let currentImageIndex = 0;
+            let imageFrameStart = 0;
+            const startTime = Date.now();
+            let lastFrameTime = startTime;
+            const targetFrameDuration = 1000 / frameRate; // Target time per frame
 
-              if (!currentImage) {
-                progressBar.classList.remove("active");
-                resolve();
-                return;
+            // Calculate exact total frames needed
+            const totalFrames = this.images.reduce((total, img) => {
+              return total + Math.round(img.duration * frameRate);
+            }, 0);
+
+            console.log("Total expected frames:", totalFrames);
+            console.log(
+              "Expected duration:",
+              totalFrames / frameRate,
+              "seconds"
+            );
+            console.log("Target frame duration:", targetFrameDuration, "ms");
+
+            const renderFrame = (currentTime) => {
+              // Calculate if enough time has passed for the next frame
+              const timeSinceLastFrame = currentTime - lastFrameTime;
+
+              if (
+                timeSinceLastFrame >= targetFrameDuration ||
+                frameCount === 0
+              ) {
+                lastFrameTime = currentTime;
+
+                if (
+                  currentImageIndex >= this.images.length ||
+                  frameCount >= totalFrames
+                ) {
+                  console.log("Final frame count:", frameCount);
+                  console.log(
+                    "Actual duration:",
+                    frameCount / frameRate,
+                    "seconds"
+                  );
+                  console.log(
+                    "Total render time:",
+                    currentTime - startTime,
+                    "ms"
+                  );
+                  progressBar.classList.remove("active");
+                  resolve();
+                  return;
+                }
+
+                const currentImage = this.images[currentImageIndex];
+                const imageFrames = Math.round(
+                  currentImage.duration * frameRate
+                );
+                const frameInImage = frameCount - imageFrameStart;
+
+                // Calculate smooth progress within this image (0 to 1)
+                let progress;
+                if (imageFrames <= 1) {
+                  progress = 1; // Single frame image
+                } else {
+                  progress = frameInImage / (imageFrames - 1);
+                  progress = Math.min(progress, 1);
+                }
+
+                // Apply easing for smooth animation
+                const easedProgress = this.applyEasing(progress);
+
+                // Update progress bar
+                const overallProgress = frameCount / totalFrames;
+                progressBar.style.setProperty("--progress", overallProgress);
+
+                // Draw the frame
+                this.drawImageWithEffect(currentImage, easedProgress);
+
+                frameCount++;
+
+                // Check if we need to move to next image
+                if (frameInImage >= imageFrames - 1) {
+                  currentImageIndex++;
+                  imageFrameStart = frameCount;
+                }
               }
 
-              const imageDuration = currentImage.duration * 1000;
-              const progress = Math.min(currentTime / imageDuration, 1);
-
-              const overallProgress =
-                (currentImageIndex + progress) / this.images.length;
-              progressBar.style.setProperty("--progress", overallProgress);
-
-              this.drawImageWithEffect(currentImage, progress);
-
-              if (progress >= 1) {
-                currentImageIndex++;
-                imageStartTime = Date.now();
-              }
-
-              if (currentImageIndex < this.images.length) {
-                setTimeout(renderFrame, frameDuration);
+              // Continue to next frame
+              if (
+                currentImageIndex < this.images.length &&
+                frameCount < totalFrames
+              ) {
+                requestAnimationFrame(renderFrame);
               } else {
+                console.log("Final frame count:", frameCount);
+                console.log(
+                  "Actual duration:",
+                  frameCount / frameRate,
+                  "seconds"
+                );
+                console.log("Total render time:", Date.now() - startTime, "ms");
                 progressBar.classList.remove("active");
                 resolve();
               }
             };
 
-            imageStartTime = Date.now();
-            renderFrame();
+            // Start rendering with requestAnimationFrame for smooth capture
+            requestAnimationFrame(renderFrame);
           });
         }
 
+        applyEasing(t) {
+          // Smooth easing function for natural animation
+          return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }
+
+        calculateOptimalBitrate(quality, frameRate) {
+          // Calculate bitrate based on resolution, frame rate, and quality
+          const baseMultiplier = frameRate / 30; // Adjust for frame rate
+
+          switch (quality) {
+            case 1080:
+              return Math.round(12000000 * baseMultiplier); // 12 Mbps for 1080p
+            case 720:
+              return Math.round(6000000 * baseMultiplier); // 6 Mbps for 720p
+            case 480:
+            default:
+              return Math.round(3000000 * baseMultiplier); // 3 Mbps for 480p
+          }
+        }
+
         finalizeVideo(format) {
+          // Use the actual MIME type from the MediaRecorder
+          const actualMimeType =
+            this.mediaRecorder.mimeType || `video/${format}`;
+
           const blob = new Blob(this.recordedChunks, {
-            type: `video/${format}`,
+            type: actualMimeType,
           });
           const url = URL.createObjectURL(blob);
 
           const a = document.createElement("a");
           a.href = url;
-          a.download = `video-editor-pro-${Date.now()}.${format}`;
+
+          // Always use .mp4 extension for better compatibility
+          const timestamp = new Date()
+            .toISOString()
+            .replace(/[:.]/g, "-")
+            .slice(0, -5);
+          a.download = `video-editor-pro-${timestamp}.mp4`;
+
           document.body.appendChild(a);
           a.click();
           document.body.removeChild(a);
 
-          setTimeout(() => URL.revokeObjectURL(url), 100);
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
 
-          this.showStatus("Video exported successfully! 🎉", "success");
-          setTimeout(() => this.hideStatus(), 3000);
+          const qualityText =
+            this.selectedQuality === 1080
+              ? "FHD (1080p)"
+              : this.selectedQuality === 720
+              ? "HD (720p)"
+              : "SD (480p)";
+
+          this.showStatus(
+            `Video exported successfully in ${qualityText}! 🎉`,
+            "success"
+          );
+          setTimeout(() => this.hideStatus(), 4000);
         }
 
         clearAll() {
